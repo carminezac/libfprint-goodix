@@ -150,6 +150,17 @@ goodix_tls_server_read (GoodixTlsServer *self, guint8 *data,
   return retr;
 }
 
+int
+goodix_tls_server_write (GoodixTlsServer *self, const guint8 *data,
+                         guint32 length, GError **error)
+{
+  int retr = SSL_write (self->ssl_layer, data, length);
+
+  if (retr <= 0)
+    *error = err_from_ssl ();
+  return retr;
+}
+
 static void
 tls_config_ssl (SSL *ssl)
 {

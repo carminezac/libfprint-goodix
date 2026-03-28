@@ -251,6 +251,17 @@ void goodix_send_protocol (FpDevice         *dev,
                            GoodixCmdCallback callback,
                            gpointer          user_data);
 
+void goodix_send_protocol_tls (FpDevice         *dev,
+                               guint8            cmd,
+                               const guint8     *payload,
+                               guint16           length,
+                               GDestroyNotify    free_func,
+                               gboolean          calc_checksum,
+                               guint             timeout_ms,
+                               gboolean          reply,
+                               GoodixCmdCallback callback,
+                               gpointer          user_data);
+
 /**
  * @brief Send nop to the device
  *
@@ -556,6 +567,12 @@ void goodix_read_tls (FpDevice         *dev,
 void goodix_tls_init (FpDevice          *dev,
                       GoodixNoneCallback callback,
                       gpointer           user_data);
+
+void goodix_tls_init_with_psk (FpDevice          *dev,
+                               const guint8      *psk,
+                               guint              psk_len,
+                               GoodixNoneCallback callback,
+                               gpointer           user_data);
 
 /**
  * @brief Shutdown TLS communication with the device

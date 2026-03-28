@@ -30,17 +30,13 @@
 
 #include <glib.h>
 #include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <openssl/evp.h>
 
 #include "drivers_api.h"
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodix5e0a.h"
-
-// ---- PSK FILE PATH ----
-
-#define GOODIX_5E0A_PSK_FILE "/etc/libfprint/goodix-5e0a.psk"
 
 typedef unsigned short Goodix5e0aPix;
 
@@ -68,7 +64,7 @@ G_DEFINE_TYPE (FpiDeviceGoodixTls5e0a, fpi_device_goodixtls5e0a,
 
 // Forward declarations
 static void goodix_5e0a_decode_frame (Goodix5e0aPix *frame, guint32 raw_size, const guint8 *raw_frame);
-static void on_calibration_image (FpDevice *dev, guint8 *data, guint16 len, gpointer user_data, GError *err) G_GNUC_UNUSED;
+static void on_calibration_image (FpDevice *dev, guint8 *data, guint16 len, gpointer user_data, GError *err);
 
 // ---- CALIBRATION ----
 
@@ -105,7 +101,7 @@ on_calibration_image (FpDevice *dev, guint8 *data, guint16 len,
   fpi_ssm_next_state (ssm);
 }
 
-G_GNUC_UNUSED static void
+static void
 linear_subtract_5e0a (Goodix5e0aPix *src, const Goodix5e0aPix *baseline,
                       guint16 len)
 {
@@ -143,21 +139,6 @@ check_none_cmd_5e0a (FpDevice *dev, guint8 *data, guint16 len,
       return;
     }
   fpi_ssm_next_state (ssm);
-}
-
-// Compute SHA-256 of data into out (must be 32 bytes)
-static gboolean
-compute_sha256 (const guint8 *data, gsize len, guint8 *out)
-{
-  EVP_MD_CTX *mdctx = EVP_MD_CTX_new ();
-  if (!mdctx) return FALSE;
-
-  unsigned int md_len = 32;
-  gboolean ok = EVP_DigestInit_ex (mdctx, EVP_sha256 (), NULL) &&
-                EVP_DigestUpdate (mdctx, data, len) &&
-                EVP_DigestFinal_ex (mdctx, out, &md_len);
-  EVP_MD_CTX_free (mdctx);
-  return ok;
 }
 
 // ---- FRAME DECODE ----
@@ -325,11 +306,13 @@ enum activate_5e0a_states {
   ACTIVATE_READ_AND_NOP1,
   ACTIVATE_ENABLE_CHIP,
   ACTIVATE_NOP2,
+  ACTIVATE_RESET_SENSOR,      /* 0xA2 [0x05, 0x14] — from RE */
+  ACTIVATE_READ_OTP,           /* 0xA6 — read 64-byte OTP */
   ACTIVATE_CHECK_PSK,
+  ACTIVATE_UPLOAD_CONFIG,      /* 0x90 — 256-byte config (plaintext, pre-TLS) */
   ACTIVATE_CMD_TLS,
   ACTIVATE_POV_IMAGE_CHECK,
   ACTIVATE_IMG_TLS,
-  ACTIVATE_CALIBRATE,
   ACTIVATE_DONE,
 
   ACTIVATE_5E0A_NUM_STATES,
@@ -337,52 +320,30 @@ enum activate_5e0a_states {
 
 static void
 on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
-                  guint8 *device_hash, guint16 length, gpointer user_data,
+                  guint8 *psk, guint16 length, gpointer user_data,
                   GError *error)
 {
   FpiSsm *ssm = user_data;
-  FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
 
   if (error)
     {
-      fp_warn ("PSK read error: %s", error->message);
-      g_error_free (error);
-      // Continue anyway — image TLS may still work or fail gracefully
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  if (!success)
+    {
+      fp_warn ("PSK read returned failure, continuing with placeholder PSK");
       fpi_ssm_next_state (ssm);
       return;
     }
 
-  if (!success || length < 32)
-    {
-      fp_warn ("PSK read returned failure or short hash (len=%d)", length);
-      fpi_ssm_next_state (ssm);
-      return;
-    }
+  g_autofree gchar *psk_str = data_to_str (psk, length);
+  fp_dbg ("Device PSK hash: 0x%s (flags: 0x%08x)", psk_str, flags);
 
-  g_autofree gchar *hash_str = data_to_str (device_hash, length);
-  fp_dbg ("Device PSK hash: 0x%s (flags: 0x%08x)", hash_str, flags);
-
-  // If we have a PSK loaded from file, verify it matches the device hash
-  if (self->has_image_psk)
-    {
-      guint8 expected_hash[32];
-      if (compute_sha256 (self->image_psk, 32, expected_hash) &&
-          memcmp (device_hash, expected_hash, 32) == 0)
-        {
-          fp_info ("PSK verified successfully");
-          fpi_ssm_next_state (ssm);
-          return;
-        }
-
-      fp_warn ("PSK file does NOT match device hash — will not erase device");
-      fp_warn ("Run extract_psk.py or whitebox_encrypt.py to set up PSK manually");
-      fp_warn ("See https://github.com/carminezac/libfprint-goodix for instructions");
-    }
-  else
-    {
-      fp_warn ("No valid PSK — run extract_psk.py or whitebox_encrypt.py to set up PSK");
-      fp_warn ("See https://github.com/carminezac/libfprint-goodix for instructions");
-    }
+  // The psk returned by preset_psk_read with flags 0xbb020001 is a hash/check,
+  // not the actual image PSK. The real PSK must be obtained separately
+  // (e.g., from Windows registry via DPAPI, or from a config file).
 
   fpi_ssm_next_state (ssm);
 }
@@ -433,6 +394,57 @@ on_img_tls_complete (FpDevice *dev, gpointer user_data, GError *error)
   fpi_ssm_next_state (ssm);
 }
 
+/* OTP callback: extract tcode/diff, patch config, store DAC */
+static void
+on_read_otp_5e0a (FpDevice *dev, guint8 *data, guint16 length,
+                   gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+
+  if (error)
+    {
+      fp_warn ("OTP read failed: %s — continuing with default config", error->message);
+      g_error_free (error);
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  if (length >= 64)
+    {
+      guint8 tcode_byte = data[0x2a];
+      guint8 tcode_comp = data[0x2b];
+      fp_dbg ("OTP[0x2a]=0x%02x OTP[0x2b]=0x%02x DAC=%02x,%02x,%02x,%02x",
+              tcode_byte, tcode_comp, data[0x32], data[0x33], data[0x34], data[0x35]);
+
+      if (tcode_byte != 0 && tcode_byte == (guint8)(~tcode_comp))
+        {
+          guint16 tcode = ((tcode_byte >> 4) + 1) * 16 + 64;
+          gint32 diff = (((tcode_byte & 0xf) + 2) * 100 * 256 / tcode) / 3 >> 4;
+          guint16 fdt_delta = (diff << 8) | 0x80;
+          fp_dbg ("  tcode=%d, diff=%d, fdt_delta=0x%04x", tcode, diff, fdt_delta);
+
+          /* Patch config: reg 0x005c = tcode, reg 0x5882 = fdt_delta */
+          for (int i = 0; i + 3 < 254; i += 4)
+            {
+              guint16 reg = (goodix_5e0a_config[i] << 8) | goodix_5e0a_config[i + 1];
+              if (reg == 0x005c)
+                { goodix_5e0a_config[i+2] = (tcode>>8)&0xFF; goodix_5e0a_config[i+3] = tcode&0xFF; }
+              else if (reg == 0x5882)
+                { goodix_5e0a_config[i+2] = (fdt_delta>>8)&0xFF; goodix_5e0a_config[i+3] = fdt_delta&0xFF; }
+            }
+          /* Recompute checksum */
+          guint32 sum = 0;
+          for (int i = 0; i < 254; i += 2)
+            sum += (goodix_5e0a_config[i] << 8) | goodix_5e0a_config[i + 1];
+          guint16 cksum = (guint16)(0 - sum);
+          goodix_5e0a_config[254] = (cksum >> 8) & 0xFF;
+          goodix_5e0a_config[255] = cksum & 0xFF;
+          fp_dbg ("  Config patched, checksum=0x%02x%02x", goodix_5e0a_config[254], goodix_5e0a_config[255]);
+        }
+    }
+  fpi_ssm_next_state (ssm);
+}
+
 static void
 activate_run_state (FpiSsm *ssm, FpDevice *dev)
 {
@@ -453,14 +465,75 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_send_nop (dev, check_none_5e0a, ssm);
       break;
 
+    case ACTIVATE_RESET_SENSOR:
+      fp_dbg ("ResetFingerPrint (0xA2) [0x05, 0x14]...");
+      {
+        GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
+        cb_info->callback = G_CALLBACK (check_none_cmd_5e0a);
+        cb_info->user_data = ssm;
+        guint8 reset_payload[] = { 0x05, 0x14 };
+        goodix_send_protocol (dev, 0xa2, reset_payload, sizeof (reset_payload),
+                              NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                              goodix_receive_default, cb_info);
+      }
+      break;
+
+    case ACTIVATE_READ_OTP:
+      fp_dbg ("GetOtp (0xA6)...");
+      goodix_send_read_otp (dev, on_read_otp_5e0a, ssm);
+      break;
+
     case ACTIVATE_CHECK_PSK:
-      goodix_send_preset_psk_read (dev, GOODIX_5E0A_PSK_FLAGS, 0,
-                                   on_psk_read_5e0a, ssm);
+      {
+        /* 5e0a needs the full 16-byte payload: [length:4][offset:4][flags:4][zero:4] */
+        guint8 psk_read_payload[16];
+        guint32 len_le = GUINT32_TO_LE (32);
+        guint32 off_le = GUINT32_TO_LE (0);
+        guint32 flags_le = GUINT32_TO_LE (GOODIX_5E0A_PSK_FLAGS);
+        guint32 zero = 0;
+        memcpy (psk_read_payload + 0,  &len_le,   4);
+        memcpy (psk_read_payload + 4,  &off_le,   4);
+        memcpy (psk_read_payload + 8,  &flags_le, 4);
+        memcpy (psk_read_payload + 12, &zero,     4);
+
+        GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
+        cb_info->callback = G_CALLBACK (on_psk_read_5e0a);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_READ,
+                              psk_read_payload, sizeof (psk_read_payload),
+                              NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                              goodix_receive_preset_psk_read, cb_info);
+      }
+      break;
+
+    case ACTIVATE_UPLOAD_CONFIG:
+      fp_dbg ("DownloadChipConfig (0x90) 256 bytes...");
+      {
+        GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
+        cb_info->callback = G_CALLBACK (check_none_cmd_5e0a);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, 0x90, goodix_5e0a_config,
+                              sizeof (goodix_5e0a_config), NULL, TRUE,
+                              GOODIX_TIMEOUT, TRUE,
+                              goodix_receive_default, cb_info);
+      }
       break;
 
     case ACTIVATE_CMD_TLS:
-      // Command TLS with PSK = 32 zero bytes (default)
-      goodix_tls_init (dev, on_cmd_tls_complete, ssm);
+      /* Command TLS uses the SAME device PSK as image TLS.
+       * RE: FetchPsk → PresetPskPskSet(ctx, raw_psk) before StartTls.
+       * The "PSK=zeros" assumption was wrong — device uses real PSK for both. */
+      if (self->has_image_psk)
+        {
+          fp_dbg ("Command TLS with device PSK...");
+          goodix_tls_init_with_psk (dev, self->image_psk, 32,
+                                    on_cmd_tls_complete, ssm);
+        }
+      else
+        {
+          fp_warn ("No PSK — skipping command TLS");
+          fpi_ssm_next_state (ssm);
+        }
       break;
 
     case ACTIVATE_POV_IMAGE_CHECK:
@@ -470,30 +543,22 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
     case ACTIVATE_IMG_TLS:
       {
         // Image TLS with the device-specific PSK.
-        // After ACTIVATE_CHECK_PSK, self->image_psk should be populated
-        // either from file or from auto-enrollment.
+        // TODO: Read the actual device-specific PSK from a config file
+        // (e.g., ~/.config/libfprint/goodix-5e0a.psk) or extract it at runtime.
+        // For now, use the PSK stored in self->image_psk if available,
+        // otherwise fall back to 32 zero bytes as a placeholder.
         const guint8 *psk = self->image_psk;
         guint psk_len = 32;
 
         if (!self->has_image_psk)
           {
-            fp_warn ("No image PSK available — image TLS will likely fail. "
-                     "Run extract_psk.py or whitebox_encrypt.py to set up PSK.");
-          }
-        else
-          {
-            fp_info ("Starting image TLS with PSK from file");
+            fp_warn ("No device-specific image PSK available, using zeros. "
+                     "Image decryption will fail unless the correct PSK is "
+                     "provided.");
           }
 
         goodix_tls_init_image (dev, psk, psk_len, on_img_tls_complete, ssm);
       }
-      break;
-
-    case ACTIVATE_CALIBRATE:
-      // Skip calibration during init — GET_IMAGE without finger causes timeout.
-      // The 5e0a sensor requires a finger to be present for image capture.
-      // Calibration would need to be done after the first FDT cycle.
-      fpi_ssm_next_state (ssm);
       break;
 
     case ACTIVATE_DONE:
@@ -593,6 +658,33 @@ scan_on_read_img_5e0a (FpDevice *dev, guint8 *data, guint16 len,
   img->flags |= FPI_IMAGE_PARTIAL;
   memcpy (img->data, sharpened, GOODIX_5E0A_FRAME_SIZE);
 
+  // Debug: save raw decrypted data and processed image
+  {
+    FILE *fd;
+    fd = fopen ("/tmp/goodix_5e0a_raw.bin", "wb");
+    if (fd) { fwrite (data, 1, len, fd); fclose (fd); }
+
+    // Save original squashed (before sharpening) for reference
+    fd = fopen ("/tmp/goodix_5e0a_image.pgm", "w");
+    if (fd)
+      {
+        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
+        fwrite (squashed, 1, GOODIX_5E0A_FRAME_SIZE, fd);
+        fclose (fd);
+      }
+
+    // Save sharpened image that NBIS will process
+    fd = fopen ("/tmp/goodix_5e0a_sharp.pgm", "w");
+    if (fd)
+      {
+        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
+        fwrite (sharpened, 1, GOODIX_5E0A_FRAME_SIZE, fd);
+        fclose (fd);
+        fp_dbg ("Saved sharpened image to /tmp/goodix_5e0a_sharp.pgm (%dx%d)",
+                img_w, img_h);
+      }
+  }
+
   free (squashed);
   free (sharpened);
 
@@ -685,14 +777,18 @@ on_fdt_manual_response (FpDevice *dev, guint8 *data, guint16 length,
 
   if (error)
     {
-      fp_warn ("FDT_MANUAL failed: %s — using static thresholds", error->message);
+      fp_warn ("FDT_MANUAL failed: %s — using has_base=0 (no thresholds)", error->message);
       g_error_free (error);
-      // Fall back to static payload
+      // Fall back to payload with has_base_data=0: sensor uses internal defaults
       FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
-      memcpy (self->fdt_down_payload, goodix_5e0a_fdt_down_mode,
-              sizeof (goodix_5e0a_fdt_down_mode));
-      memcpy (self->fdt_up_payload, goodix_5e0a_fdt_up_mode,
-              sizeof (goodix_5e0a_fdt_up_mode));
+      memset (self->fdt_down_payload, 0, sizeof (self->fdt_down_payload));
+      self->fdt_down_payload[0] = 0x1c;  // FDT_DOWN prefix
+      self->fdt_down_payload[1] = 0x00;  // has_base_data = 0
+      memcpy (self->fdt_down_payload + 2, dac_base, 8);  // DAC values from OTP
+      memset (self->fdt_up_payload, 0, sizeof (self->fdt_up_payload));
+      self->fdt_up_payload[0] = 0x0e;    // FDT_UP prefix
+      self->fdt_up_payload[1] = 0x00;    // has_base_data = 0
+      memcpy (self->fdt_up_payload + 2, dac_base, 8);
       fpi_ssm_next_state (ssm);
       return;
     }
@@ -702,13 +798,17 @@ on_fdt_manual_response (FpDevice *dev, guint8 *data, guint16 length,
   // Raw base: 6 zones x uint16_t LE
   if (length < 16)
     {
-      fp_warn ("FDT_MANUAL response too short (%d bytes) — using static thresholds",
+      fp_warn ("FDT_MANUAL response too short (%d bytes) — using has_base=0",
                length);
       FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
-      memcpy (self->fdt_down_payload, goodix_5e0a_fdt_down_mode,
-              sizeof (goodix_5e0a_fdt_down_mode));
-      memcpy (self->fdt_up_payload, goodix_5e0a_fdt_up_mode,
-              sizeof (goodix_5e0a_fdt_up_mode));
+      memset (self->fdt_down_payload, 0, sizeof (self->fdt_down_payload));
+      self->fdt_down_payload[0] = 0x1c;
+      self->fdt_down_payload[1] = 0x00;
+      memcpy (self->fdt_down_payload + 2, dac_base, 8);
+      memset (self->fdt_up_payload, 0, sizeof (self->fdt_up_payload));
+      self->fdt_up_payload[0] = 0x0e;
+      self->fdt_up_payload[1] = 0x00;
+      memcpy (self->fdt_up_payload + 2, dac_base, 8);
       fpi_ssm_next_state (ssm);
       return;
     }
@@ -765,10 +865,10 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
         cb_info->callback = G_CALLBACK (on_fdt_manual_response);
         cb_info->user_data = ssm;
         goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE,
-                              fdt_manual_payload,
-                              sizeof (fdt_manual_payload),
-                              NULL, TRUE, GOODIX_TIMEOUT, TRUE,
-                              goodix_receive_default, cb_info);
+                                  fdt_manual_payload,
+                                  sizeof (fdt_manual_payload),
+                                  NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                                  goodix_receive_default, cb_info);
       }
       break;
 
@@ -780,10 +880,10 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
         cb_info->callback = G_CALLBACK (check_none_cmd_5e0a);
         cb_info->user_data = ssm;
         goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN,
-                              self->fdt_down_payload,
-                              sizeof (self->fdt_down_payload),
-                              NULL, TRUE, 0, TRUE,
-                              goodix_receive_default, cb_info);
+                                  self->fdt_down_payload,
+                                  sizeof (self->fdt_down_payload),
+                                  NULL, TRUE, 0, TRUE,
+                                  goodix_receive_default, cb_info);
       }
       break;
 
@@ -806,9 +906,9 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
         cb_info->callback = G_CALLBACK (check_none_cmd_5e0a);
         cb_info->user_data = ssm;
         goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP,
-                              self->fdt_up_payload,
-                              sizeof (self->fdt_up_payload),
-                              NULL, TRUE, 0, TRUE,
+                                  self->fdt_up_payload,
+                                  sizeof (self->fdt_up_payload),
+                                  NULL, TRUE, 0, TRUE,
                               goodix_receive_default, cb_info);
       }
       break;
@@ -987,7 +1087,9 @@ fpi_device_goodixtls5e0a_init (FpiDeviceGoodixTls5e0a *self)
   //   /etc/libfprint/goodix-5e0a.psk
   //   ~/.config/libfprint/goodix-5e0a.psk
   if (!load_psk_from_file (self))
-    fp_warn ("No PSK file found — run extract_psk.py or whitebox_encrypt.py to set up PSK");
+    fp_warn ("No image PSK loaded — image TLS will fail. "
+             "Run extract_psk.py and save PSK to "
+             "/etc/libfprint/goodix-5e0a.psk");
 }
 
 static void

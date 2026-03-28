@@ -74,6 +74,11 @@ int goodix_tls_server_read (GoodixTlsServer *self,
                             guint32          length,
                             GError         **error);
 
+int goodix_tls_server_write (GoodixTlsServer *self,
+                             const guint8    *data,
+                             guint32          length,
+                             GError         **error);
+
 /**
  * @brief Write a message directly to the client end of the TLS connection.
  *  This should be used to dump encrypted data directly from the device

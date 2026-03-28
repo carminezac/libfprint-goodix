@@ -50,6 +50,7 @@ typedef struct
 
   gboolean            ack;
   gboolean            reply;
+  gboolean            tls_cmd;  /* TRUE: response comes as 0xb0, needs decrypt */
 
   GoodixCmdCallback   callback;
   gpointer            user_data;
@@ -197,8 +198,18 @@ goodix_receive_preset_psk_read (FpDevice *dev, guint8 *data, guint16 length,
       return;
     }
 
+  fp_dbg ("preset_psk_read response: len=%d, data[0]=0x%02x", length, data[0]);
+  if (length > 1)
+    {
+      g_autofree gchar *hex = g_malloc (length * 3 + 1);
+      for (guint16 i = 0; i < length && i < 48; i++)
+        g_snprintf (hex + i * 3, 4, "%02x ", data[i]);
+      fp_dbg ("  raw: %s", hex);
+    }
+
   if (data[0] != 0x00)
     {
+      fp_warn ("preset_psk_read: device returned status 0x%02x (expected 0x00)", data[0]);
       callback (dev, FALSE, 0x00000000, NULL, 0, cb_info->user_data, NULL);
       return;
     }
@@ -404,7 +415,31 @@ goodix_receive_pack (FpDevice *dev, guint8 *data, guint32 length)
 
     case GOODIX_FLAGS_TLS:
       fp_dbg ("Got TLS msg");
-      goodix_receive_done (dev, payload, payload_len, NULL);
+      if (priv->tls_cmd && priv->tls_hop)
+        {
+          /* Decrypt TLS response: feed ciphertext to SSL, read plaintext */
+          goodix_tls_client_write (priv->tls_hop, payload, payload_len);
+          guint8 *plain = g_malloc (4096);
+          GError *tls_err = NULL;
+          int plain_len = goodix_tls_server_read (priv->tls_hop, plain, 4096, &tls_err);
+          if (plain_len > 0)
+            {
+              fp_dbg ("TLS cmd response decrypted: %d bytes", plain_len);
+              priv->tls_cmd = FALSE;
+              goodix_receive_protocol (dev, plain, plain_len);
+            }
+          else
+            {
+              fp_warn ("TLS cmd decrypt failed");
+              priv->tls_cmd = FALSE;
+              goodix_receive_done (dev, payload, payload_len, tls_err);
+            }
+          g_free (plain);
+        }
+      else
+        {
+          goodix_receive_done (dev, payload, payload_len, NULL);
+        }
       break;
 
     case GOODIX_FLAGS_TLS_DATA:
@@ -596,6 +631,87 @@ goodix_send_protocol (
       return;
     }
   ;
+}
+
+void
+goodix_send_protocol_tls (
+  FpDevice *dev, guint8 cmd, const guint8 *payload, guint16 length,
+  GDestroyNotify free_func, gboolean calc_checksum, guint timeout_ms,
+  gboolean reply, GoodixCmdCallback callback, gpointer user_data)
+{
+  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+  FpiDeviceGoodixTlsPrivate *priv =
+    fpi_device_goodixtls_get_instance_private (self);
+  GError *error = NULL;
+  guint8 *proto_data;
+  guint32 proto_len;
+
+  if (priv->ack || priv->reply || priv->timeout)
+    {
+      fp_warn ("A command is already running: 0x%02x", priv->cmd);
+      if (free_func)
+        free_func ((void *) payload);
+      return;
+    }
+
+  if (!priv->tls_hop)
+    {
+      fp_warn ("TLS not established, falling back to plaintext for cmd 0x%02x", cmd);
+      goodix_send_protocol (dev, cmd, payload, length, free_func,
+                            calc_checksum, timeout_ms, reply, callback, user_data);
+      return;
+    }
+
+  fp_dbg ("Running TLS-encrypted command: 0x%02x", cmd);
+
+  if (timeout_ms)
+    priv->timeout = fpi_device_add_timeout (
+      dev, timeout_ms, goodix_receive_timeout_cb, NULL, NULL);
+  priv->cmd = cmd;
+  priv->ack = TRUE;
+  priv->reply = reply;
+  priv->tls_cmd = TRUE;
+  priv->callback = callback;
+  priv->user_data = user_data;
+
+  /* Encode the protocol message (same format as plaintext) */
+  goodix_encode_protocol (cmd, payload, length, calc_checksum, FALSE,
+                          &proto_data, &proto_len);
+  if (free_func)
+    free_func ((void *) payload);
+
+  /* Encrypt via TLS: write plaintext to SSL, read ciphertext from client_fd */
+  fp_dbg ("TLS cmd: SSL_write %d bytes...", proto_len);
+  GError *tls_err = NULL;
+  int written = goodix_tls_server_write (priv->tls_hop, proto_data, proto_len, &tls_err);
+  g_free (proto_data);
+  fp_dbg ("TLS cmd: SSL_write returned %d", written);
+
+  if (written <= 0)
+    {
+      fp_warn ("TLS encrypt failed for cmd 0x%02x", cmd);
+      goodix_receive_done (dev, NULL, 0, tls_err);
+      return;
+    }
+
+  /* Read the encrypted TLS record from the client side */
+  guint8 tls_buf[4096];
+  int tls_len = goodix_tls_client_read (priv->tls_hop, tls_buf, sizeof (tls_buf));
+  if (tls_len <= 0)
+    {
+      fp_warn ("Failed to read TLS ciphertext for cmd 0x%02x", cmd);
+      goodix_receive_done (dev, NULL, 0, NULL);
+      return;
+    }
+
+  fp_dbg ("TLS encrypted cmd 0x%02x: %d plaintext -> %d ciphertext bytes", cmd, written, tls_len);
+
+  /* Send the ciphertext as a TLS packet (0xb0) to the device */
+  if (!goodix_send_pack (dev, GOODIX_FLAGS_TLS, tls_buf, tls_len, NULL, &error))
+    {
+      goodix_receive_done (dev, NULL, 0, error);
+      return;
+    }
 }
 void
 goodix_send_nop (FpDevice *dev, GoodixNoneCallback callback,
@@ -1551,6 +1667,34 @@ goodix_tls_init (FpDevice *dev, GoodixNoneCallback callback, gpointer user_data)
     {
       fp_err ("failed to init tls server, error: %s, code: %d", err->message,
               err->code);
+      return;
+    }
+
+  goodix_tls_ready (s, err, self);
+}
+
+void
+goodix_tls_init_with_psk (FpDevice *dev, const guint8 *psk, guint psk_len,
+                           GoodixNoneCallback callback, gpointer user_data)
+{
+  fp_dbg ("Starting up goodix tls server (custom PSK, %u bytes)", psk_len);
+  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+  FpiDeviceGoodixTlsPrivate *priv =
+    fpi_device_goodixtls_get_instance_private (self);
+  g_assert (priv->tls_hop == NULL);
+  priv->tls_hop = malloc (sizeof (GoodixTlsServer));
+
+  if (!priv->tls_ready_callback)
+    priv->tls_ready_callback = malloc (sizeof (GoodixCallbackInfo));
+  priv->tls_ready_callback->callback = G_CALLBACK (callback);
+  priv->tls_ready_callback->user_data = user_data;
+  GoodixTlsServer *s = priv->tls_hop;
+  s->user_data = self;
+  GError *err = NULL;
+  if (!goodix_tls_server_init_with_psk (priv->tls_hop, psk, psk_len, &err))
+    {
+      fp_err ("failed to init tls server with PSK, error: %s, code: %d",
+              err->message, err->code);
       return;
     }
 
