@@ -32,11 +32,153 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <sys/stat.h>
 
 #include "drivers_api.h"
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodix5e0a.h"
+
+// ---- SecWhiteEncrypt (RE: Wbdi.dll SecWhiteEncrypt @ 0x180005f30) ----
+
+static const guint8 WB_SALT[] = "123GOODIX";   /* 9 bytes */
+static const guint8 WB_CONSTANT[16] = {
+  0x5c, 0xba, 0x6e, 0x25, 0x81, 0x95, 0x18, 0xde,
+  0x2d, 0x53, 0xe9, 0x6d, 0xc0, 0x34, 0x7a, 0xb0
+};
+
+/* Encrypt PSK using Goodix whitebox algorithm.
+ * Input:  psk (32 bytes)
+ * Output: out (96 bytes) = nonce(16) + ciphertext(48) + hmac(32)
+ * Returns 0 on success, -1 on failure. */
+static int
+sec_white_encrypt (const guint8 *psk, gsize psk_len, guint8 *out)
+{
+  guint8 nonce_input[4 + 9];  /* LE32(len) + "123GOODIX" */
+  guint8 hash1[32], hash2[32];
+  guint8 nonce[16];
+  guint8 nonce_padded[64 + 16];  /* nonce padded to 64 + WB_CONSTANT */
+  guint8 padded[48];             /* PKCS7 padded PSK */
+  guint8 ciphertext[48];
+  guint8 hmac_tag[32];
+  unsigned int hmac_len = 32;
+  int ct_len = 0, final_len = 0;
+
+  /* Step 1: nonce = SHA256(LE32(psk_len) || "123GOODIX")[:16] */
+  nonce_input[0] = (psk_len >>  0) & 0xFF;
+  nonce_input[1] = (psk_len >>  8) & 0xFF;
+  nonce_input[2] = (psk_len >> 16) & 0xFF;
+  nonce_input[3] = (psk_len >> 24) & 0xFF;
+  memcpy (nonce_input + 4, WB_SALT, 9);
+  SHA256 (nonce_input, 13, hash1);
+  memcpy (nonce, hash1, 16);
+
+  /* Step 2: tweak byte[15] — low nibble = (b15 ^ data_len_low) & 0x0f ^ b15 */
+  guint8 b15 = nonce[15];
+  guint8 dl = psk_len & 0xFF;
+  nonce[15] = ((b15 ^ dl) & 0x0F) ^ b15;
+
+  /* Step 3: derive keys — SHA256(nonce_padded_to_64 || WB_CONSTANT) */
+  memset (nonce_padded, 0, sizeof (nonce_padded));
+  memcpy (nonce_padded, nonce, 16);
+  memcpy (nonce_padded + 64, WB_CONSTANT, 16);
+  SHA256 (nonce_padded, 80, hash2);
+
+  /* aes_key = hash2[:16], hmac_key = hash2[:32] */
+
+  /* Step 4: PKCS7 pad PSK to 48 bytes (32 + 16 padding of 0x10) */
+  memcpy (padded, psk, psk_len);
+  guint8 pad_val = 16 - (psk_len % 16);
+  if (pad_val == 0) pad_val = 16;
+  memset (padded + psk_len, pad_val, pad_val);
+
+  /* Step 5: AES-128-CBC encrypt */
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new ();
+  if (!ctx) return -1;
+  EVP_CIPHER_CTX_set_padding (ctx, 0);  /* we handle PKCS7 manually */
+  if (EVP_EncryptInit_ex (ctx, EVP_aes_128_cbc (), NULL, hash2, nonce) != 1 ||
+      EVP_EncryptUpdate (ctx, ciphertext, &ct_len, padded, psk_len + pad_val) != 1 ||
+      EVP_EncryptFinal_ex (ctx, ciphertext + ct_len, &final_len) != 1)
+    {
+      EVP_CIPHER_CTX_free (ctx);
+      return -1;
+    }
+  ct_len += final_len;
+  EVP_CIPHER_CTX_free (ctx);
+
+  /* Step 6: HMAC-SHA256(hash2[:32], ciphertext) */
+  HMAC (EVP_sha256 (), hash2, 32, ciphertext, ct_len, hmac_tag, &hmac_len);
+
+  /* Step 7: output = nonce(16) + ciphertext(48) + hmac(32) */
+  memcpy (out,      nonce,      16);
+  memcpy (out + 16, ciphertext, ct_len);
+  memcpy (out + 16 + ct_len, hmac_tag, 32);
+
+  return 0;
+}
+
+// ---- PSK Enrollment Protocol ----
+
+static const guint8 PRE_FLAGS[10] = {
+  0x56, 0xa5, 0xbb, 0x95, 0x6b, 0x7c, 0x8d, 0x9e, 0x00, 0x00
+};
+
+#define TLV_PSK_DPAPI    0xBB010002
+#define TLV_PSK_WHITEBOX 0xBB010003
+#define CMD_PSK_WRITE    0xE0
+#define CMD_PSK_READ     0xE4
+#define PSK_CHUNK_SIZE   256
+
+/* Build the PSK write payload: PRE_FLAGS + TLV(DPAPI) + TLV(whitebox).
+ * fake_dpapi: 32 bytes (MCU stores opaquely, doesn't decrypt).
+ * wb_blob: 96 bytes from sec_white_encrypt.
+ * out: must be at least 154 bytes. Returns payload length. */
+static gsize
+build_psk_payload (const guint8 *fake_dpapi, const guint8 *wb_blob, guint8 *out)
+{
+  guint8 *p = out;
+
+  memcpy (p, PRE_FLAGS, 10);
+  p += 10;
+
+  /* TLV1: DPAPI blob */
+  guint32 t1 = GUINT32_TO_LE (TLV_PSK_DPAPI);
+  guint32 l1 = GUINT32_TO_LE (32);
+  memcpy (p, &t1, 4); p += 4;
+  memcpy (p, &l1, 4); p += 4;
+  memcpy (p, fake_dpapi, 32); p += 32;
+
+  /* TLV2: Whitebox encrypted PSK */
+  guint32 t2 = GUINT32_TO_LE (TLV_PSK_WHITEBOX);
+  guint32 l2 = GUINT32_TO_LE (96);
+  memcpy (p, &t2, 4); p += 4;
+  memcpy (p, &l2, 4); p += 4;
+  memcpy (p, wb_blob, 96); p += 96;
+
+  return (gsize)(p - out);  /* 154 bytes */
+}
+
+/* Build a chunk buffer: [total_len:4][chunk_len:4][offset:4][data].
+ * Returns total size of chunk buffer (12 + data_len). */
+static gsize
+build_chunk (const guint8 *payload, gsize total_len, gsize offset,
+             gsize chunk_len, guint8 *out)
+{
+  guint32 total_le = GUINT32_TO_LE ((guint32)total_len);
+  guint32 chunk_le = GUINT32_TO_LE ((guint32)chunk_len);
+  guint32 off_le   = GUINT32_TO_LE ((guint32)offset);
+
+  memcpy (out + 0, &total_le, 4);
+  memcpy (out + 4, &chunk_le, 4);
+  memcpy (out + 8, &off_le, 4);
+  memcpy (out + 12, payload + offset, chunk_len);
+
+  return 12 + chunk_len;
+}
 
 typedef unsigned short Goodix5e0aPix;
 
@@ -300,6 +442,264 @@ goodix_5e0a_unsharp_mask (guint8 *out, const guint8 *in,
     }
 }
 
+// ---- PSK ENROLLMENT SUB-SSM ----
+// Triggered when ACTIVATE_CHECK_PSK detects missing/invalid PSK.
+// Flow: write chunk (0xE0) → confirm (0xE4) → verify hash → save file.
+
+enum psk_enroll_states {
+  PSK_ENROLL_WRITE_CHUNK,
+  PSK_ENROLL_CONFIRM_CHUNK,
+  PSK_ENROLL_VERIFY,
+  PSK_ENROLL_SAVE,
+
+  PSK_ENROLL_NUM_STATES,
+};
+
+/* Stored context for enrollment in progress */
+typedef struct {
+  guint8 new_psk[32];
+  guint8 chunk_buf[12 + PSK_CHUNK_SIZE];
+  gsize  chunk_buf_len;
+  FpiSsm *parent_ssm;
+} PskEnrollCtx;
+
+static void
+on_psk_write_response (FpDevice *dev, guint8 *data, guint16 length,
+                       gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+
+  if (error)
+    {
+      fp_err ("PSK write (0xE0) failed: %s", error->message);
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+  if (length < 1 || data[0] != 0)
+    {
+      fp_err ("PSK write rejected by MCU (status=%d)", length > 0 ? data[0] : -1);
+      fpi_ssm_mark_failed (ssm,
+        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "PSK write rejected"));
+      return;
+    }
+  fp_dbg ("PSK write chunk accepted");
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_psk_confirm_response (FpDevice *dev, guint8 *data, guint16 length,
+                         gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+
+  if (error)
+    {
+      fp_warn ("PSK confirm (0xE4) error: %s — continuing", error->message);
+      g_error_free (error);
+    }
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_psk_verify_hash (FpDevice *dev, gboolean success, guint32 flags,
+                    guint8 *device_hash, guint16 length, gpointer user_data,
+                    GError *error)
+{
+  FpiSsm *ssm = user_data;
+  PskEnrollCtx *ctx = fpi_ssm_get_data (ssm);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+  if (!success || length < 32)
+    {
+      fpi_ssm_mark_failed (ssm,
+        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "PSK verify: read hash failed"));
+      return;
+    }
+
+  guint8 expected[32];
+  SHA256 (ctx->new_psk, 32, expected);
+
+  if (memcmp (device_hash, expected, 32) != 0)
+    {
+      fp_err ("PSK verify: hash MISMATCH!");
+      fpi_ssm_mark_failed (ssm,
+        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "PSK hash mismatch after write"));
+      return;
+    }
+
+  fp_info ("PSK verified successfully on device");
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+psk_enroll_run (FpiSsm *ssm, FpDevice *dev)
+{
+  PskEnrollCtx *ctx = fpi_ssm_get_data (ssm);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case PSK_ENROLL_WRITE_CHUNK:
+      fp_dbg ("PSK enrollment: writing chunk (0xE0)...");
+      {
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (on_psk_write_response);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, CMD_PSK_WRITE,
+                              ctx->chunk_buf, ctx->chunk_buf_len,
+                              NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                              goodix_receive_default, cb_info);
+      }
+      break;
+
+    case PSK_ENROLL_CONFIRM_CHUNK:
+      fp_dbg ("PSK enrollment: confirming chunk (0xE4)...");
+      {
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (on_psk_confirm_response);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, CMD_PSK_READ,
+                              ctx->chunk_buf, ctx->chunk_buf_len,
+                              NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                              goodix_receive_default, cb_info);
+      }
+      break;
+
+    case PSK_ENROLL_VERIFY:
+      fp_dbg ("PSK enrollment: verifying hash...");
+      {
+        /* Read hash using correct 16-byte payload format */
+        guint8 psk_read_payload[16];
+        guint32 len_le = GUINT32_TO_LE (32);
+        guint32 off_le = GUINT32_TO_LE (0);
+        guint32 flags_le = GUINT32_TO_LE (GOODIX_5E0A_PSK_FLAGS);
+        guint32 zero = 0;
+        memcpy (psk_read_payload + 0,  &len_le,   4);
+        memcpy (psk_read_payload + 4,  &off_le,   4);
+        memcpy (psk_read_payload + 8,  &flags_le, 4);
+        memcpy (psk_read_payload + 12, &zero,     4);
+
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (on_psk_verify_hash);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, GOODIX_CMD_PRESET_PSK_READ,
+                              psk_read_payload, sizeof (psk_read_payload),
+                              NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                              goodix_receive_preset_psk_read, cb_info);
+      }
+      break;
+
+    case PSK_ENROLL_SAVE:
+      fp_dbg ("PSK enrollment: saving to file...");
+      {
+        FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
+        const char *psk_path = "/etc/libfprint/goodix-5e0a.psk";
+
+        /* Convert PSK to hex string */
+        gchar hex[65];
+        for (int i = 0; i < 32; i++)
+          g_snprintf (hex + i * 2, 3, "%02x", ctx->new_psk[i]);
+
+        /* Create directory if needed */
+        g_mkdir_with_parents ("/etc/libfprint", 0755);
+
+        /* Write hex PSK to file */
+        FILE *f = fopen (psk_path, "w");
+        if (f)
+          {
+            fprintf (f, "%s\n", hex);
+            fclose (f);
+            chmod (psk_path, 0600);
+            fp_info ("PSK saved to %s", psk_path);
+
+            /* Load into device context */
+            memcpy (self->image_psk, ctx->new_psk, 32);
+            self->has_image_psk = TRUE;
+          }
+        else
+          {
+            fp_warn ("Failed to save PSK to %s — enrollment worked but PSK is ephemeral", psk_path);
+            /* Still load into memory for this session */
+            memcpy (self->image_psk, ctx->new_psk, 32);
+            self->has_image_psk = TRUE;
+          }
+
+        fpi_ssm_next_state (ssm);
+      }
+      break;
+    }
+}
+
+static void
+psk_enroll_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  PskEnrollCtx *ctx = fpi_ssm_get_data (ssm);
+  FpiSsm *parent = ctx->parent_ssm;
+  g_free (ctx);
+
+  if (error)
+    {
+      fp_err ("PSK enrollment failed: %s", error->message);
+      fpi_ssm_mark_failed (parent, error);
+      return;
+    }
+
+  fp_info ("PSK enrollment completed successfully");
+  fpi_ssm_next_state (parent);
+}
+
+/* Start PSK enrollment: generates random PSK, encrypts, writes to sensor.
+ * parent_ssm will be advanced on success or failed on error. */
+static void
+start_psk_enrollment (FpDevice *dev, FpiSsm *parent_ssm)
+{
+  PskEnrollCtx *ctx = g_new0 (PskEnrollCtx, 1);
+  ctx->parent_ssm = parent_ssm;
+
+  /* Generate random PSK */
+  if (RAND_bytes (ctx->new_psk, 32) != 1)
+    {
+      fp_err ("Failed to generate random PSK");
+      g_free (ctx);
+      fpi_ssm_mark_failed (parent_ssm,
+        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "RAND_bytes failed"));
+      return;
+    }
+
+  g_autofree gchar *hex = data_to_str (ctx->new_psk, 32);
+  fp_info ("Generated new PSK: 0x%s", hex);
+
+  /* Whitebox encrypt */
+  guint8 wb_blob[96];
+  if (sec_white_encrypt (ctx->new_psk, 32, wb_blob) != 0)
+    {
+      fp_err ("SecWhiteEncrypt failed");
+      g_free (ctx);
+      fpi_ssm_mark_failed (parent_ssm,
+        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "SecWhiteEncrypt failed"));
+      return;
+    }
+  fp_dbg ("Whitebox encrypted: 96 bytes");
+
+  /* Build payload */
+  guint8 payload[160];
+  guint8 fake_dpapi[32] = {0};
+  gsize payload_len = build_psk_payload (fake_dpapi, wb_blob, payload);
+  fp_dbg ("PSK payload: %zu bytes", payload_len);
+
+  /* Build single chunk (payload < 256, so one chunk) */
+  ctx->chunk_buf_len = build_chunk (payload, payload_len, 0, payload_len,
+                                    ctx->chunk_buf);
+
+  /* Start enrollment SSM */
+  FpiSsm *ssm = fpi_ssm_new (dev, psk_enroll_run, PSK_ENROLL_NUM_STATES);
+  fpi_ssm_set_data (ssm, ctx, NULL);
+  fpi_ssm_start (ssm, psk_enroll_complete);
+}
+
 // ---- ACTIVATION STATE MACHINE ----
 
 enum activate_5e0a_states {
@@ -320,32 +720,57 @@ enum activate_5e0a_states {
 
 static void
 on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
-                  guint8 *psk, guint16 length, gpointer user_data,
+                  guint8 *device_hash, guint16 length, gpointer user_data,
                   GError *error)
 {
   FpiSsm *ssm = user_data;
+  FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
 
   if (error)
     {
-      fpi_ssm_mark_failed (ssm, error);
-      return;
-    }
-
-  if (!success)
-    {
-      fp_warn ("PSK read returned failure, continuing with placeholder PSK");
+      fp_warn ("PSK read error: %s", error->message);
+      g_error_free (error);
+      /* No PSK on device — try enrollment */
+      if (!self->has_image_psk)
+        {
+          fp_info ("No PSK on device or file — starting enrollment");
+          start_psk_enrollment (dev, ssm);
+          return;
+        }
       fpi_ssm_next_state (ssm);
       return;
     }
 
-  g_autofree gchar *psk_str = data_to_str (psk, length);
-  fp_dbg ("Device PSK hash: 0x%s (flags: 0x%08x)", psk_str, flags);
+  if (!success || length < 32)
+    {
+      fp_warn ("PSK read failed (len=%d) — trying enrollment", length);
+      start_psk_enrollment (dev, ssm);
+      return;
+    }
 
-  // The psk returned by preset_psk_read with flags 0xbb020001 is a hash/check,
-  // not the actual image PSK. The real PSK must be obtained separately
-  // (e.g., from Windows registry via DPAPI, or from a config file).
+  g_autofree gchar *hash_str = data_to_str (device_hash, length);
+  fp_dbg ("Device PSK hash: 0x%s", hash_str);
 
-  fpi_ssm_next_state (ssm);
+  /* If we have a PSK from file, verify it matches device hash */
+  if (self->has_image_psk)
+    {
+      guint8 expected[32];
+      SHA256 (self->image_psk, 32, expected);
+      if (memcmp (device_hash, expected, 32) == 0)
+        {
+          fp_info ("PSK verified — file matches device");
+          fpi_ssm_next_state (ssm);
+          return;
+        }
+      fp_warn ("PSK file does NOT match device — re-enrolling");
+    }
+  else
+    {
+      fp_info ("No PSK file — enrolling new PSK");
+    }
+
+  /* PSK missing or mismatch — enroll new one */
+  start_psk_enrollment (dev, ssm);
 }
 
 static void
