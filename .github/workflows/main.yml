@@ -17,7 +17,7 @@ jobs:
       - uses: BSFishy/meson-build@v1.0.3
         with:
           action: build
-          setup-options: --prefix /usr/ --buildtype=release
+          setup-options: --prefix /usr/ --buildtype=release -Ddoc=false -Dintrospection=false
           options: --verbose
           meson-version: 0.63.3
           ninja-version: 1.10.2
