@@ -14,7 +14,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgusb-dev libgirepository1.0-dev libnss3-dev libgudev-1.0-dev gtk-doc-tools libopencv-dev doctest-dev
+          sudo apt-get install -y libgusb-dev libgirepository1.0-dev libnss3-dev libgudev-1.0-dev gtk-doc-tools libopencv-dev doctest-dev libpixman-1-dev libcairo2-dev
       - uses: BSFishy/meson-build@v1.0.3
         with:
           action: build
