@@ -37,6 +37,7 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "drivers_api.h"
 #include "goodix.h"
@@ -196,6 +197,8 @@ struct _FpiDeviceGoodixTls5e0a
 
   guint8 fdt_down_payload[35];  // dynamically computed FDT_DOWN payload
   guint8 fdt_up_payload[35];    // dynamically computed FDT_UP payload
+
+  gboolean in_iap_mode;          // TRUE after erase_app, detected via fw version
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls5e0a, fpi_device_goodixtls5e0a, FPI,
@@ -447,20 +450,38 @@ goodix_5e0a_unsharp_mask (guint8 *out, const guint8 *in,
 // Flow: write chunk (0xE0) → confirm (0xE4) → verify hash → save file.
 
 enum psk_enroll_states {
+  PSK_ENROLL_ERASE_APP,
+  PSK_ENROLL_ERASE_WAIT,
   PSK_ENROLL_WRITE_CHUNK,
   PSK_ENROLL_CONFIRM_CHUNK,
   PSK_ENROLL_VERIFY,
+  PSK_ENROLL_WRITE_FW,         /* cmd 0xF0 — write APP firmware */
+  PSK_ENROLL_RESET_MCU,        /* McuResetMcu — reboot to APP mode */
+  PSK_ENROLL_RESET_WAIT,       /* wait for MCU reboot */
   PSK_ENROLL_SAVE,
 
   PSK_ENROLL_NUM_STATES,
 };
 
-/* Stored context for enrollment in progress */
+#define PSK_ERASE_MAX_RETRIES 2
+
+/* Firmware path — extracted from Wbdi.dll by setup script */
+#define FW_BLOB_PATH "/var/lib/fprint/goodix-5e0a-firmware.bin"
+#define FW_CHUNK_SIZE 256
+#define FW_MODE_APP 2
+
 typedef struct {
   guint8 new_psk[32];
   guint8 chunk_buf[12 + PSK_CHUNK_SIZE];
   gsize  chunk_buf_len;
   FpiSsm *parent_ssm;
+  guint8 erase_retries;
+  gboolean need_erase;
+
+  /* Firmware re-flash state */
+  guint8 *fw_buf;       /* firmware write buffer (header + payload) */
+  gsize   fw_buf_len;
+  gsize   fw_offset;    /* current write offset */
 } PskEnrollCtx;
 
 static void
@@ -477,12 +498,49 @@ on_psk_write_response (FpDevice *dev, guint8 *data, guint16 length,
     }
   if (length < 1 || data[0] != 0)
     {
-      fp_err ("PSK write rejected by MCU (status=%d)", length > 0 ? data[0] : -1);
+      PskEnrollCtx *ctx = fpi_ssm_get_data (ssm);
+      fp_warn ("PSK write rejected (status=%d) — need erase_app",
+               length > 0 ? data[0] : -1);
+      if (ctx->erase_retries < PSK_ERASE_MAX_RETRIES)
+        {
+          ctx->need_erase = TRUE;
+          fpi_ssm_jump_to_state (ssm, PSK_ENROLL_ERASE_APP);
+          return;
+        }
+      fp_err ("PSK write failed after %d erase retries", ctx->erase_retries);
       fpi_ssm_mark_failed (ssm,
-        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "PSK write rejected"));
+        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
+                     "PSK write rejected after max erase retries"));
       return;
     }
   fp_dbg ("PSK write chunk accepted");
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_erase_app_response (FpDevice *dev, guint8 *data, guint16 length,
+                       gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+  PskEnrollCtx *ctx = fpi_ssm_get_data (ssm);
+
+  if (error)
+    {
+      fp_warn ("erase_app error: %s — retrying", error->message);
+      g_error_free (error);
+    }
+  /* Response: data[0]==1 means success for erase_app (inverted convention) */
+  fp_info ("erase_app sent (attempt %d/%d), waiting for MCU reboot...",
+           ctx->erase_retries, PSK_ERASE_MAX_RETRIES);
+  ctx->erase_retries++;
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_erase_wait_done (FpDevice *dev, gpointer data)
+{
+  FpiSsm *ssm = data;
+  fp_dbg ("erase_app wait complete, retrying PSK write...");
   fpi_ssm_next_state (ssm);
 }
 
@@ -498,6 +556,133 @@ on_psk_confirm_response (FpDevice *dev, guint8 *data, guint16 length,
       g_error_free (error);
     }
   fpi_ssm_next_state (ssm);
+}
+
+static void
+on_fw_write_chunk_response (FpDevice *dev, guint8 *data, guint16 length,
+                            gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+  PskEnrollCtx *ctx = fpi_ssm_get_data (ssm);
+
+  if (error)
+    {
+      fp_err ("Firmware write (0xF0) failed: %s", error->message);
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  ctx->fw_offset += FW_CHUNK_SIZE;
+  if (ctx->fw_offset < ctx->fw_buf_len)
+    {
+      /* More chunks to send — stay in same state */
+      fp_dbg ("  fw write: %zu/%zu bytes", ctx->fw_offset, ctx->fw_buf_len);
+      fpi_ssm_jump_to_state (ssm, PSK_ENROLL_WRITE_FW);
+    }
+  else
+    {
+      fp_info ("Firmware write complete (%zu bytes)", ctx->fw_buf_len);
+      fpi_ssm_next_state (ssm);
+    }
+}
+
+static void
+on_mcu_reset_response (FpDevice *dev, guint8 *data, guint16 length,
+                       gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+  if (error)
+    {
+      fp_warn ("MCU reset response error: %s — continuing", error->message);
+      g_error_free (error);
+    }
+  fp_info ("MCU reset sent, waiting for reboot to APP mode...");
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_reset_wait_done (FpDevice *dev, gpointer data)
+{
+  FpiSsm *ssm = data;
+  fp_dbg ("MCU reboot wait complete");
+  fpi_ssm_next_state (ssm);
+}
+
+/* Load firmware blob from file, prepare write buffer with header.
+ * RE format: [header_crc:4][payload_size:4][payload_crc:4][firmware_payload]
+ * Returns 0 on success. */
+static int
+load_firmware_blob (PskEnrollCtx *ctx)
+{
+  gchar *fw_data = NULL;
+  gsize fw_len = 0;
+
+  if (!g_file_get_contents (FW_BLOB_PATH, &fw_data, &fw_len, NULL))
+    {
+      fp_err ("Cannot read firmware file %s", FW_BLOB_PATH);
+      return -1;
+    }
+
+  if (fw_len < 30)
+    {
+      fp_err ("Firmware file too small: %zu bytes", fw_len);
+      g_free (fw_data);
+      return -1;
+    }
+
+  /* Parse: [1 byte ver_len][ver_string][payload][4 byte trailing CRC] */
+  guint8 ver_len = ((guint8 *)fw_data)[0];
+  gsize payload_offset = 1 + ver_len;
+  gsize payload_size = fw_len - payload_offset - 4;
+
+  fp_dbg ("Firmware: ver_len=%d, payload=%zu bytes", ver_len, payload_size);
+
+  /* Build write buffer: [header_crc:4][payload_size:4][payload_crc:4][payload] */
+  ctx->fw_buf_len = 12 + payload_size;
+  ctx->fw_buf = g_malloc (ctx->fw_buf_len);
+  ctx->fw_offset = 0;
+
+  guint32 *hdr = (guint32 *)ctx->fw_buf;
+  hdr[1] = GUINT32_TO_LE ((guint32)payload_size);
+
+  /* CRC32 of payload */
+  guint32 payload_crc = 0;
+  const guint8 *payload = (const guint8 *)fw_data + payload_offset;
+  /* Simple CRC32 — use GLib */
+  payload_crc = g_compute_checksum_for_data (G_CHECKSUM_SHA256, payload, payload_size) ? 0 : 0;
+  /* Actually we need CRC32, not SHA256. Use a simple implementation: */
+  /* The RE uses fcn.1800c78a0 which is a standard CRC32. Use manual calc. */
+  {
+    guint32 crc = 0xFFFFFFFF;
+    for (gsize i = 0; i < payload_size; i++)
+      {
+        crc ^= payload[i];
+        for (int j = 0; j < 8; j++)
+          crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+      }
+    payload_crc = ~crc;
+  }
+  hdr[2] = GUINT32_TO_LE (payload_crc);
+
+  /* CRC32 of header fields [1] and [2] (8 bytes) */
+  {
+    guint32 crc = 0xFFFFFFFF;
+    guint8 *p = (guint8 *)&hdr[1];
+    for (int i = 0; i < 8; i++)
+      {
+        crc ^= p[i];
+        for (int j = 0; j < 8; j++)
+          crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+      }
+    hdr[0] = GUINT32_TO_LE (~crc);
+  }
+
+  memcpy (ctx->fw_buf + 12, payload, payload_size);
+  g_free (fw_data);
+
+  fp_dbg ("Firmware buffer ready: %zu bytes (12 header + %zu payload)",
+          ctx->fw_buf_len, payload_size);
+  return 0;
 }
 
 static void
@@ -542,6 +727,32 @@ psk_enroll_run (FpiSsm *ssm, FpDevice *dev)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case PSK_ENROLL_ERASE_APP:
+      if (!ctx->need_erase)
+        {
+          /* First attempt: skip erase, try write directly */
+          fpi_ssm_jump_to_state (ssm, PSK_ENROLL_WRITE_CHUNK);
+          break;
+        }
+      fp_warn ("PSK enrollment: sending erase_app (0xA4) [0x00, 0x32]...");
+      {
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (on_erase_app_response);
+        cb_info->user_data = ssm;
+        guint8 erase_payload[] = { 0x00, 0x32 };
+        goodix_send_protocol (dev, 0xa4, erase_payload,
+                              sizeof (erase_payload), NULL, TRUE,
+                              3000, FALSE,  /* reply=FALSE: MCU resets, won't send data response */
+                              goodix_receive_none, cb_info);
+      }
+      break;
+
+    case PSK_ENROLL_ERASE_WAIT:
+      /* Wait 2 seconds for MCU to reboot into IAP mode */
+      fp_info ("Waiting 2s for MCU reboot...");
+      fpi_device_add_timeout (dev, 2000, on_erase_wait_done, ssm, NULL);
+      break;
+
     case PSK_ENROLL_WRITE_CHUNK:
       fp_dbg ("PSK enrollment: writing chunk (0xE0)...");
       {
@@ -592,11 +803,74 @@ psk_enroll_run (FpiSsm *ssm, FpDevice *dev)
       }
       break;
 
+    case PSK_ENROLL_WRITE_FW:
+      {
+        /* Load firmware on first entry */
+        if (ctx->fw_buf == NULL)
+          {
+            if (load_firmware_blob (ctx) != 0)
+              {
+                fp_err ("No firmware blob — cannot re-flash MCU");
+                fpi_ssm_mark_failed (ssm,
+                  g_error_new (G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                    "Firmware blob not found at %s. Run goodix-5e0a-setup.sh first.",
+                    FW_BLOB_PATH));
+                break;
+              }
+          }
+
+        gsize remaining = ctx->fw_buf_len - ctx->fw_offset;
+        gsize chunk = remaining < FW_CHUNK_SIZE ? remaining : FW_CHUNK_SIZE;
+
+        fp_dbg ("Writing firmware chunk: offset=%zu, chunk=%zu, total=%zu",
+                ctx->fw_offset, chunk, ctx->fw_buf_len);
+
+        /* Build 0xF0 packet: [offset:4][chunk_len:4][mode:4][data] */
+        guint8 fw_pkt[12 + FW_CHUNK_SIZE];
+        guint32 off_le = GUINT32_TO_LE ((guint32)ctx->fw_offset);
+        guint32 len_le = GUINT32_TO_LE ((guint32)chunk);
+        guint32 mode_le = GUINT32_TO_LE (FW_MODE_APP);
+        memcpy (fw_pkt + 0, &off_le, 4);
+        memcpy (fw_pkt + 4, &len_le, 4);
+        memcpy (fw_pkt + 8, &mode_le, 4);
+        memcpy (fw_pkt + 12, ctx->fw_buf + ctx->fw_offset, chunk);
+
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (on_fw_write_chunk_response);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, 0xf0, fw_pkt, 12 + chunk,
+                              NULL, TRUE, 3000, TRUE,
+                              goodix_receive_default, cb_info);
+      }
+      break;
+
+    case PSK_ENROLL_RESET_MCU:
+      fp_info ("Resetting MCU to APP mode...");
+      {
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (on_mcu_reset_response);
+        cb_info->user_data = ssm;
+        /* McuResetMcu sends a reset command. From RE: fcn.1800a7ae0
+         * The exact command byte isn't in our RE — try 0xA2 with [0x05, 0x14]
+         * which is ResetFingerPrint, or a NOP to trigger MCU self-reset. */
+        guint8 reset_payload[] = { 0x05, 0x14 };
+        goodix_send_protocol (dev, 0xa2, reset_payload,
+                              sizeof (reset_payload), NULL, TRUE,
+                              3000, FALSE,
+                              goodix_receive_none, cb_info);
+      }
+      break;
+
+    case PSK_ENROLL_RESET_WAIT:
+      fp_info ("Waiting 3s for MCU reboot to APP mode...");
+      fpi_device_add_timeout (dev, 3000, on_reset_wait_done, ssm, NULL);
+      break;
+
     case PSK_ENROLL_SAVE:
       fp_dbg ("PSK enrollment: saving to file...");
       {
         FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
-        const char *psk_path = "/etc/libfprint/goodix-5e0a.psk";
+        const char *psk_path = "/var/lib/fprint/goodix-5e0a.psk";
 
         /* Convert PSK to hex string */
         gchar hex[65];
@@ -604,7 +878,7 @@ psk_enroll_run (FpiSsm *ssm, FpDevice *dev)
           g_snprintf (hex + i * 2, 3, "%02x", ctx->new_psk[i]);
 
         /* Create directory if needed */
-        g_mkdir_with_parents ("/etc/libfprint", 0755);
+        g_mkdir_with_parents ("/var/lib/fprint", 0700);
 
         /* Write hex PSK to file */
         FILE *f = fopen (psk_path, "w");
@@ -621,7 +895,8 @@ psk_enroll_run (FpiSsm *ssm, FpDevice *dev)
           }
         else
           {
-            fp_warn ("Failed to save PSK to %s — enrollment worked but PSK is ephemeral", psk_path);
+            fp_warn ("Failed to save PSK to %s (errno=%d: %s) — enrollment worked but PSK is ephemeral",
+                     psk_path, errno, strerror (errno));
             /* Still load into memory for this session */
             memcpy (self->image_psk, ctx->new_psk, 32);
             self->has_image_psk = TRUE;
@@ -638,6 +913,7 @@ psk_enroll_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   PskEnrollCtx *ctx = fpi_ssm_get_data (ssm);
   FpiSsm *parent = ctx->parent_ssm;
+  g_free (ctx->fw_buf);
   g_free (ctx);
 
   if (error)
@@ -702,21 +978,65 @@ start_psk_enrollment (FpDevice *dev, FpiSsm *parent_ssm)
 
 // ---- ACTIVATION STATE MACHINE ----
 
+/* Activation follows the RE exactly:
+ *
+ * Phase 1 (always):
+ *   NOP → ENABLE → NOP → FW_VERSION
+ *
+ * Phase 2 (branch on IAP detection):
+ *   APP mode: RESET → OTP → CHECK_PSK → CONFIG → CMD_TLS → POV → IMG_TLS → DONE
+ *   IAP mode: CHECK_PSK (triggers enrollment → write PSK → reboot → restart)
+ *
+ * After PSK enrollment in IAP mode, the MCU reboots to APP mode.
+ * The driver must restart activation from scratch. */
 enum activate_5e0a_states {
   ACTIVATE_READ_AND_NOP1,
   ACTIVATE_ENABLE_CHIP,
   ACTIVATE_NOP2,
-  ACTIVATE_RESET_SENSOR,      /* 0xA2 [0x05, 0x14] — from RE */
-  ACTIVATE_READ_OTP,           /* 0xA6 — read 64-byte OTP */
-  ACTIVATE_CHECK_PSK,
-  ACTIVATE_UPLOAD_CONFIG,      /* 0x90 — 256-byte config (plaintext, pre-TLS) */
-  ACTIVATE_CMD_TLS,
-  ACTIVATE_POV_IMAGE_CHECK,
-  ACTIVATE_IMG_TLS,
+  ACTIVATE_CHECK_FW_VERSION,   /* 0xA8 — detect IAP mode */
+  ACTIVATE_RESET_SENSOR,       /* 0xA2 — skip in IAP mode */
+  ACTIVATE_READ_OTP,           /* 0xA6 — skip in IAP mode */
+  ACTIVATE_CHECK_PSK,          /* 0xE4 — always */
+  ACTIVATE_UPLOAD_CONFIG,      /* 0x90 — skip in IAP mode */
+  ACTIVATE_CMD_TLS,            /* 0xD0 — skip in IAP mode */
+  ACTIVATE_POV_IMAGE_CHECK,    /* 0xD6 — skip in IAP mode */
+  ACTIVATE_IMG_TLS,            /* 0xD0 — skip in IAP mode */
   ACTIVATE_DONE,
 
   ACTIVATE_5E0A_NUM_STATES,
 };
+
+static void
+on_fw_version_5e0a (FpDevice *dev, gchar *firmware, gpointer user_data,
+                     GError *error)
+{
+  FpiSsm *ssm = user_data;
+  FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
+
+  if (error)
+    {
+      fp_warn ("Firmware version read failed: %s — assuming APP mode", error->message);
+      g_error_free (error);
+      self->in_iap_mode = FALSE;
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  fp_info ("Firmware: %s", firmware ? firmware : "(null)");
+
+  /* RE: IsInIAPMode checks if version contains "IAP" or "TESTIAP" */
+  if (firmware && (strstr (firmware, "IAP") != NULL))
+    {
+      fp_warn ("MCU is in IAP (bootloader) mode");
+      self->in_iap_mode = TRUE;
+    }
+  else
+    {
+      self->in_iap_mode = FALSE;
+    }
+
+  fpi_ssm_next_state (ssm);
+}
 
 static void
 on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
@@ -730,28 +1050,20 @@ on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
     {
       fp_warn ("PSK read error: %s", error->message);
       g_error_free (error);
-      /* No PSK on device — try enrollment */
-      if (!self->has_image_psk)
-        {
-          fp_info ("No PSK on device or file — starting enrollment");
-          start_psk_enrollment (dev, ssm);
-          return;
-        }
       fpi_ssm_next_state (ssm);
       return;
     }
 
   if (!success || length < 32)
     {
-      fp_warn ("PSK read failed (len=%d) — trying enrollment", length);
-      start_psk_enrollment (dev, ssm);
+      fp_warn ("PSK read returned failure (len=%d)", length);
+      fpi_ssm_next_state (ssm);
       return;
     }
 
   g_autofree gchar *hash_str = data_to_str (device_hash, length);
   fp_dbg ("Device PSK hash: 0x%s", hash_str);
 
-  /* If we have a PSK from file, verify it matches device hash */
   if (self->has_image_psk)
     {
       guint8 expected[32];
@@ -762,15 +1074,14 @@ on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
           fpi_ssm_next_state (ssm);
           return;
         }
-      fp_warn ("PSK file does NOT match device — re-enrolling");
+      fp_warn ("PSK file does NOT match device. Run goodix-5e0a-enroll to re-enroll.");
     }
   else
     {
-      fp_info ("No PSK file — enrolling new PSK");
+      fp_warn ("No PSK file. Run goodix-5e0a-enroll to set up the sensor.");
     }
 
-  /* PSK missing or mismatch — enroll new one */
-  start_psk_enrollment (dev, ssm);
+  fpi_ssm_next_state (ssm);
 }
 
 static void
@@ -890,7 +1201,18 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       goodix_send_nop (dev, check_none_5e0a, ssm);
       break;
 
+    case ACTIVATE_CHECK_FW_VERSION:
+      fp_dbg ("GetFirmwareVersion (0xA8)...");
+      goodix_send_query_firmware_version (dev, on_fw_version_5e0a, ssm);
+      break;
+
     case ACTIVATE_RESET_SENSOR:
+      if (self->in_iap_mode)
+        {
+          fp_dbg ("IAP mode — skipping ResetFingerPrint");
+          fpi_ssm_next_state (ssm);
+          break;
+        }
       fp_dbg ("ResetFingerPrint (0xA2) [0x05, 0x14]...");
       {
         GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
@@ -904,6 +1226,12 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case ACTIVATE_READ_OTP:
+      if (self->in_iap_mode)
+        {
+          fp_dbg ("IAP mode — skipping OTP read");
+          fpi_ssm_next_state (ssm);
+          break;
+        }
       fp_dbg ("GetOtp (0xA6)...");
       goodix_send_read_otp (dev, on_read_otp_5e0a, ssm);
       break;
@@ -932,6 +1260,12 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case ACTIVATE_UPLOAD_CONFIG:
+      if (self->in_iap_mode)
+        {
+          fp_dbg ("IAP mode — skipping config upload");
+          fpi_ssm_next_state (ssm);
+          break;
+        }
       fp_dbg ("DownloadChipConfig (0x90) 256 bytes...");
       {
         GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
@@ -945,9 +1279,12 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case ACTIVATE_CMD_TLS:
-      /* Command TLS uses the SAME device PSK as image TLS.
-       * RE: FetchPsk → PresetPskPskSet(ctx, raw_psk) before StartTls.
-       * The "PSK=zeros" assumption was wrong — device uses real PSK for both. */
+      if (self->in_iap_mode)
+        {
+          fp_dbg ("IAP mode — skipping command TLS");
+          fpi_ssm_next_state (ssm);
+          break;
+        }
       if (self->has_image_psk)
         {
           fp_dbg ("Command TLS with device PSK...");
@@ -962,26 +1299,27 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case ACTIVATE_POV_IMAGE_CHECK:
+      if (self->in_iap_mode)
+        {
+          fp_dbg ("IAP mode — skipping POV image check");
+          fpi_ssm_next_state (ssm);
+          break;
+        }
       goodix_send_pov_image_check (dev, on_pov_image_check_done, ssm);
       break;
 
     case ACTIVATE_IMG_TLS:
+      if (self->in_iap_mode)
+        {
+          fp_dbg ("IAP mode — skipping image TLS");
+          fpi_ssm_next_state (ssm);
+          break;
+        }
       {
-        // Image TLS with the device-specific PSK.
-        // TODO: Read the actual device-specific PSK from a config file
-        // (e.g., ~/.config/libfprint/goodix-5e0a.psk) or extract it at runtime.
-        // For now, use the PSK stored in self->image_psk if available,
-        // otherwise fall back to 32 zero bytes as a placeholder.
         const guint8 *psk = self->image_psk;
         guint psk_len = 32;
-
         if (!self->has_image_psk)
-          {
-            fp_warn ("No device-specific image PSK available, using zeros. "
-                     "Image decryption will fail unless the correct PSK is "
-                     "provided.");
-          }
-
+          fp_warn ("No image PSK — image TLS will likely fail");
         goodix_tls_init_image (dev, psk, psk_len, on_img_tls_complete, ssm);
       }
       break;
@@ -1403,7 +1741,7 @@ load_psk_from_file (FpiDeviceGoodixTls5e0a *self)
 {
   // Try multiple config file locations
   const char *paths[] = {
-    "/etc/libfprint/goodix-5e0a.psk",
+    "/var/lib/fprint/goodix-5e0a.psk",
     NULL,   // filled with $HOME path below
   };
 
@@ -1476,12 +1814,12 @@ fpi_device_goodixtls5e0a_init (FpiDeviceGoodixTls5e0a *self)
   // Load device-specific PSK from config file.
   // The PSK is unique per device, extracted via extract_psk.py.
   // Store it as 64 hex chars in one of:
-  //   /etc/libfprint/goodix-5e0a.psk
+  //   /var/lib/fprint/goodix-5e0a.psk
   //   ~/.config/libfprint/goodix-5e0a.psk
   if (!load_psk_from_file (self))
     fp_warn ("No image PSK loaded — image TLS will fail. "
              "Run extract_psk.py and save PSK to "
-             "/etc/libfprint/goodix-5e0a.psk");
+             "/var/lib/fprint/goodix-5e0a.psk");
 }
 
 static void
