@@ -658,33 +658,6 @@ scan_on_read_img_5e0a (FpDevice *dev, guint8 *data, guint16 len,
   img->flags |= FPI_IMAGE_PARTIAL;
   memcpy (img->data, sharpened, GOODIX_5E0A_FRAME_SIZE);
 
-  // Debug: save raw decrypted data and processed image
-  {
-    FILE *fd;
-    fd = fopen ("/tmp/goodix_5e0a_raw.bin", "wb");
-    if (fd) { fwrite (data, 1, len, fd); fclose (fd); }
-
-    // Save original squashed (before sharpening) for reference
-    fd = fopen ("/tmp/goodix_5e0a_image.pgm", "w");
-    if (fd)
-      {
-        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
-        fwrite (squashed, 1, GOODIX_5E0A_FRAME_SIZE, fd);
-        fclose (fd);
-      }
-
-    // Save sharpened image that NBIS will process
-    fd = fopen ("/tmp/goodix_5e0a_sharp.pgm", "w");
-    if (fd)
-      {
-        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
-        fwrite (sharpened, 1, GOODIX_5E0A_FRAME_SIZE, fd);
-        fclose (fd);
-        fp_dbg ("Saved sharpened image to /tmp/goodix_5e0a_sharp.pgm (%dx%d)",
-                img_w, img_h);
-      }
-  }
-
   free (squashed);
   free (sharpened);
 
@@ -769,6 +742,20 @@ build_fdt_payload (guint8 *payload, guint8 prefix, const guint16 *thresholds)
   payload[34] = 0x00;
 }
 
+/* Set FDT payloads with has_base=0 (no thresholds, sensor uses internal defaults) */
+static void
+set_fdt_fallback_payloads (FpiDeviceGoodixTls5e0a *self)
+{
+  memset (self->fdt_down_payload, 0, sizeof (self->fdt_down_payload));
+  self->fdt_down_payload[0] = 0x1c;
+  self->fdt_down_payload[1] = 0x00;
+  memcpy (self->fdt_down_payload + 2, dac_base, 8);
+  memset (self->fdt_up_payload, 0, sizeof (self->fdt_up_payload));
+  self->fdt_up_payload[0] = 0x0e;
+  self->fdt_up_payload[1] = 0x00;
+  memcpy (self->fdt_up_payload + 2, dac_base, 8);
+}
+
 static void
 on_fdt_manual_response (FpDevice *dev, guint8 *data, guint16 length,
                         gpointer user_data, GError *error)
@@ -777,38 +764,18 @@ on_fdt_manual_response (FpDevice *dev, guint8 *data, guint16 length,
 
   if (error)
     {
-      fp_warn ("FDT_MANUAL failed: %s — using has_base=0 (no thresholds)", error->message);
+      fp_warn ("FDT_MANUAL failed: %s — using has_base=0", error->message);
       g_error_free (error);
-      // Fall back to payload with has_base_data=0: sensor uses internal defaults
-      FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
-      memset (self->fdt_down_payload, 0, sizeof (self->fdt_down_payload));
-      self->fdt_down_payload[0] = 0x1c;  // FDT_DOWN prefix
-      self->fdt_down_payload[1] = 0x00;  // has_base_data = 0
-      memcpy (self->fdt_down_payload + 2, dac_base, 8);  // DAC values from OTP
-      memset (self->fdt_up_payload, 0, sizeof (self->fdt_up_payload));
-      self->fdt_up_payload[0] = 0x0e;    // FDT_UP prefix
-      self->fdt_up_payload[1] = 0x00;    // has_base_data = 0
-      memcpy (self->fdt_up_payload + 2, dac_base, 8);
+      set_fdt_fallback_payloads (FPI_DEVICE_GOODIXTLS5E0A (dev));
       fpi_ssm_next_state (ssm);
       return;
     }
 
-  // Response inner data format: [4 bytes header] [12 bytes raw base]
-  // Header: [status, irq_type, touch_flag_lo, touch_flag_hi]
-  // Raw base: 6 zones x uint16_t LE
   if (length < 16)
     {
       fp_warn ("FDT_MANUAL response too short (%d bytes) — using has_base=0",
                length);
-      FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
-      memset (self->fdt_down_payload, 0, sizeof (self->fdt_down_payload));
-      self->fdt_down_payload[0] = 0x1c;
-      self->fdt_down_payload[1] = 0x00;
-      memcpy (self->fdt_down_payload + 2, dac_base, 8);
-      memset (self->fdt_up_payload, 0, sizeof (self->fdt_up_payload));
-      self->fdt_up_payload[0] = 0x0e;
-      self->fdt_up_payload[1] = 0x00;
-      memcpy (self->fdt_up_payload + 2, dac_base, 8);
+      set_fdt_fallback_payloads (FPI_DEVICE_GOODIXTLS5E0A (dev));
       fpi_ssm_next_state (ssm);
       return;
     }

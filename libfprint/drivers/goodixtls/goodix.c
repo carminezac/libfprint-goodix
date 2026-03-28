@@ -198,18 +198,8 @@ goodix_receive_preset_psk_read (FpDevice *dev, guint8 *data, guint16 length,
       return;
     }
 
-  fp_dbg ("preset_psk_read response: len=%d, data[0]=0x%02x", length, data[0]);
-  if (length > 1)
-    {
-      g_autofree gchar *hex = g_malloc (length * 3 + 1);
-      for (guint16 i = 0; i < length && i < 48; i++)
-        g_snprintf (hex + i * 3, 4, "%02x ", data[i]);
-      fp_dbg ("  raw: %s", hex);
-    }
-
   if (data[0] != 0x00)
     {
-      fp_warn ("preset_psk_read: device returned status 0x%02x (expected 0x00)", data[0]);
       callback (dev, FALSE, 0x00000000, NULL, 0, cb_info->user_data, NULL);
       return;
     }

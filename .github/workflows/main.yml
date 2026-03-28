@@ -60,11 +60,11 @@ jobs:
         run: nfpm pkg --packager rpm --config ./nfpm_rpm.yaml --target ./output/
       - name: Generating ArchLinux package
         run: nfpm pkg --packager archlinux --config ./nfpm_arch.yaml --target ./output/
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: meson-build-artifacts
           path: /home/runner/work/libfprint/libfprint/build
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: deb-rpm-arch-packages
           path: /home/runner/work/libfprint/libfprint/output
