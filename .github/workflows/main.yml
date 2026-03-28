@@ -1,4 +1,4 @@
-name: Build Linux packages
+name: Build
 on:
   workflow_dispatch:
   push:
@@ -10,11 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgusb-dev libgirepository1.0-dev libnss3-dev libgudev-1.0-dev gtk-doc-tools libopencv-dev doctest-dev libpixman-1-dev libcairo2-dev
+          sudo apt-get install -y libgusb-dev libgirepository1.0-dev libnss3-dev libgudev-1.0-dev libpixman-1-dev libcairo2-dev libopencv-dev
       - uses: BSFishy/meson-build@v1.0.3
         with:
           action: build
@@ -22,35 +21,3 @@ jobs:
           options: --verbose
           meson-version: 0.63.3
           ninja-version: 1.10.2
-      - name: Install nFPM
-        run: echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list && sudo apt update && sudo apt install nfpm
-      - name: Prepare nFPM DEB config
-        run: |
-          cp nfpm_deb_sample.yaml nfpm_deb.yaml
-          sed -i "s/COMMITID/$(git rev-parse --short HEAD)/g" nfpm_deb.yaml
-          mkdir -p ./output
-          cd build && sed -i "s/LIBVERSION/$(meson introspect --projectinfo | jq -r '.version')/g" ../nfpm_deb.yaml
-      - name: Prepare nFPM RPM config
-        run: |
-          cp nfpm_rpm_sample.yaml nfpm_rpm.yaml
-          sed -i "s/COMMITID/$(git rev-parse --short HEAD)/g" nfpm_rpm.yaml
-          cd build && sed -i "s/LIBVERSION/$(meson introspect --projectinfo | jq -r '.version')/g" ../nfpm_rpm.yaml
-      - name: Prepare nFPM Arch config
-        run: |
-          cp nfpm_arch_sample.yaml nfpm_arch.yaml
-          sed -i "s/COMMITID/$(git rev-parse --short HEAD)/g" nfpm_arch.yaml
-          cd build && sed -i "s/LIBVERSION/$(meson introspect --projectinfo | jq -r '.version')/g" ../nfpm_arch.yaml
-      - name: Generating DEB package
-        run: nfpm pkg --packager deb --config ./nfpm_deb.yaml --target ./output/
-      - name: Generating RPM package
-        run: nfpm pkg --packager rpm --config ./nfpm_rpm.yaml --target ./output/
-      - name: Generating ArchLinux package
-        run: nfpm pkg --packager archlinux --config ./nfpm_arch.yaml --target ./output/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: meson-build-artifacts
-          path: build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: deb-rpm-arch-packages
-          path: output
