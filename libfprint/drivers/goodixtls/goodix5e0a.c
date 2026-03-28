@@ -124,6 +124,66 @@ sec_white_encrypt (const guint8 *psk, gsize psk_len, guint8 *out)
 
 // ---- PSK Enrollment Protocol ----
 
+/* CRC-32/MPEG-2: poly 0x04C11DB7, init 0xFFFFFFFF, no final XOR, MSB-first.
+ * RE: fcn.1800c78a0 in Wbdi.dll */
+static guint32
+crc32_mpeg2 (const guint8 *data, gsize len)
+{
+  guint32 crc = 0xFFFFFFFF;
+  for (gsize i = 0; i < len; i++)
+    {
+      crc ^= (guint32)data[i] << 24;
+      for (int j = 0; j < 8; j++)
+        crc = (crc & 0x80000000) ? (crc << 1) ^ 0x04C11DB7 : crc << 1;
+    }
+  return crc;
+}
+
+/* Compute PMK HMAC for firmware verification.
+ * RE: production_get_pmk_hmac @ 0x18003cf9c in Wbdi.dll
+ *
+ * raw_pmk (68 bytes):
+ *   [0x00][psk_len_byte][ZEROS*32][0x00][psk_len_byte][PSK*32]
+ *   PSK is ONLY in the second half. First half is zeros.
+ *
+ * pmk = SHA256(raw_pmk)
+ * mod = [1, 2, 3, ..., 64]
+ * pmk_hmac = HMAC-SHA256(key=pmk, data=mod)
+ *
+ * Then for firmware verify:
+ * fw_hmac = HMAC-SHA256(key=pmk_hmac, data=write_buf) */
+static gboolean
+compute_fw_hmac (const guint8 *psk, gsize psk_len,
+                 const guint8 *write_buf, gsize write_buf_len,
+                 guint8 *out_hmac)
+{
+  /* Step 1: Build raw_pmk (68 bytes) — RE exact layout */
+  guint8 raw_pmk[68];
+  memset (raw_pmk, 0, 68);
+  raw_pmk[1] = (guint8)psk_len;                  /* offset 1: psk_len byte */
+  raw_pmk[0x23] = (guint8)psk_len;               /* offset 35: psk_len byte */
+  memcpy (raw_pmk + 0x24, psk, psk_len);          /* offset 36: PSK (second half ONLY) */
+
+  /* Step 2: pmk = SHA256(raw_pmk) */
+  guint8 pmk[32];
+  SHA256 (raw_pmk, 68, pmk);
+
+  /* Step 3: mod = [1, 2, ..., 64] */
+  guint8 mod[64];
+  for (int i = 0; i < 64; i++)
+    mod[i] = (guint8)(i + 1);
+
+  /* Step 4: pmk_hmac = HMAC-SHA256(key=pmk, data=mod) */
+  guint8 pmk_hmac[32];
+  unsigned int hmac_len = 32;
+  HMAC (EVP_sha256 (), pmk, 32, mod, 64, pmk_hmac, &hmac_len);
+
+  /* Step 5: fw_hmac = HMAC-SHA256(key=pmk_hmac, data=write_buf) */
+  HMAC (EVP_sha256 (), pmk_hmac, 32, write_buf, write_buf_len, out_hmac, &hmac_len);
+
+  return TRUE;
+}
+
 static const guint8 PRE_FLAGS[10] = {
   0x56, 0xa5, 0xbb, 0x95, 0x6b, 0x7c, 0x8d, 0x9e, 0x00, 0x00
 };
@@ -455,7 +515,8 @@ enum psk_enroll_states {
   PSK_ENROLL_WRITE_CHUNK,
   PSK_ENROLL_CONFIRM_CHUNK,
   PSK_ENROLL_VERIFY,
-  PSK_ENROLL_WRITE_FW,         /* cmd 0xF0 — write APP firmware */
+  PSK_ENROLL_WRITE_FW,         /* cmd 0xF0 — write APP firmware (chunked) */
+  PSK_ENROLL_VERIFY_FW,        /* cmd 0xF4 — HMAC verify firmware */
   PSK_ENROLL_RESET_MCU,        /* McuResetMcu — reboot to APP mode */
   PSK_ENROLL_RESET_WAIT,       /* wait for MCU reboot */
   PSK_ENROLL_SAVE,
@@ -587,6 +648,32 @@ on_fw_write_chunk_response (FpDevice *dev, guint8 *data, guint16 length,
 }
 
 static void
+on_fw_verify_response (FpDevice *dev, guint8 *data, guint16 length,
+                       gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+
+  if (error)
+    {
+      fp_err ("Firmware verify (0xF4) error: %s", error->message);
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  /* RE: DLL checks "if (check_ok != 0) → success" */
+  if (length < 1 || data[0] == 0)
+    {
+      fp_err ("Firmware verify FAILED (status=%d)", length > 0 ? data[0] : -1);
+      fpi_ssm_mark_failed (ssm,
+        g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "Firmware HMAC verification failed"));
+      return;
+    }
+
+  fp_info ("Firmware verified OK (status=%d)", data[0]);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
 on_mcu_reset_response (FpDevice *dev, guint8 *data, guint16 length,
                        gpointer user_data, GError *error)
 {
@@ -645,37 +732,15 @@ load_firmware_blob (PskEnrollCtx *ctx)
   guint32 *hdr = (guint32 *)ctx->fw_buf;
   hdr[1] = GUINT32_TO_LE ((guint32)payload_size);
 
-  /* CRC32 of payload */
-  guint32 payload_crc = 0;
+  /* CRC-32/MPEG-2: poly 0x04C11DB7, init 0xFFFFFFFF, no final XOR, MSB-first.
+   * RE: fcn.1800c78a0 in Wbdi.dll */
   const guint8 *payload = (const guint8 *)fw_data + payload_offset;
-  /* Simple CRC32 — use GLib */
-  payload_crc = g_compute_checksum_for_data (G_CHECKSUM_SHA256, payload, payload_size) ? 0 : 0;
-  /* Actually we need CRC32, not SHA256. Use a simple implementation: */
-  /* The RE uses fcn.1800c78a0 which is a standard CRC32. Use manual calc. */
-  {
-    guint32 crc = 0xFFFFFFFF;
-    for (gsize i = 0; i < payload_size; i++)
-      {
-        crc ^= payload[i];
-        for (int j = 0; j < 8; j++)
-          crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-      }
-    payload_crc = ~crc;
-  }
+
+  guint32 payload_crc = crc32_mpeg2 (payload, payload_size);
   hdr[2] = GUINT32_TO_LE (payload_crc);
 
-  /* CRC32 of header fields [1] and [2] (8 bytes) */
-  {
-    guint32 crc = 0xFFFFFFFF;
-    guint8 *p = (guint8 *)&hdr[1];
-    for (int i = 0; i < 8; i++)
-      {
-        crc ^= p[i];
-        for (int j = 0; j < 8; j++)
-          crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-      }
-    hdr[0] = GUINT32_TO_LE (~crc);
-  }
+  guint32 hdr_crc = crc32_mpeg2 ((const guint8 *)&hdr[1], 8);
+  hdr[0] = GUINT32_TO_LE (hdr_crc);
 
   memcpy (ctx->fw_buf + 12, payload, payload_size);
   g_free (fw_data);
@@ -839,6 +904,23 @@ psk_enroll_run (FpiSsm *ssm, FpDevice *dev)
         cb_info->callback = G_CALLBACK (on_fw_write_chunk_response);
         cb_info->user_data = ssm;
         goodix_send_protocol (dev, 0xf0, fw_pkt, 12 + chunk,
+                              NULL, TRUE, 3000, TRUE,
+                              goodix_receive_default, cb_info);
+      }
+      break;
+
+    case PSK_ENROLL_VERIFY_FW:
+      fp_info ("Verifying firmware (0xF4)...");
+      {
+        /* Compute HMAC over write_buf using correct PMK derivation */
+        guint8 fw_hmac[32];
+        compute_fw_hmac (ctx->new_psk, 32, ctx->fw_buf, ctx->fw_buf_len, fw_hmac);
+
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (on_fw_verify_response);
+        cb_info->user_data = ssm;
+        /* RE: DLL sends ONLY 32-byte HMAC via cmd 0xF4 */
+        goodix_send_protocol (dev, 0xf4, fw_hmac, 32,
                               NULL, TRUE, 3000, TRUE,
                               goodix_receive_default, cb_info);
       }
@@ -1048,16 +1130,16 @@ on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
 
   if (error)
     {
-      fp_warn ("PSK read error: %s", error->message);
+      fp_warn ("PSK read error: %s — starting enrollment", error->message);
       g_error_free (error);
-      fpi_ssm_next_state (ssm);
+      start_psk_enrollment (dev, ssm);
       return;
     }
 
   if (!success || length < 32)
     {
-      fp_warn ("PSK read returned failure (len=%d)", length);
-      fpi_ssm_next_state (ssm);
+      fp_warn ("PSK read failed (len=%d) — starting enrollment", length);
+      start_psk_enrollment (dev, ssm);
       return;
     }
 
@@ -1074,14 +1156,14 @@ on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
           fpi_ssm_next_state (ssm);
           return;
         }
-      fp_warn ("PSK file does NOT match device. Run goodix-5e0a-enroll to re-enroll.");
+      fp_warn ("PSK mismatch — starting auto-enrollment");
     }
   else
     {
-      fp_warn ("No PSK file. Run goodix-5e0a-enroll to set up the sensor.");
+      fp_info ("No PSK file — starting auto-enrollment");
     }
 
-  fpi_ssm_next_state (ssm);
+  start_psk_enrollment (dev, ssm);
 }
 
 static void
@@ -1237,6 +1319,13 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case ACTIVATE_CHECK_PSK:
+      if (self->in_iap_mode)
+        {
+          /* In IAP mode, skip PSK read (unreliable) and go straight to enrollment */
+          fp_info ("IAP mode — starting PSK enrollment directly");
+          start_psk_enrollment (dev, ssm);
+          break;
+        }
       {
         /* 5e0a needs the full 16-byte payload: [length:4][offset:4][flags:4][zero:4] */
         guint8 psk_read_payload[16];
