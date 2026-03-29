@@ -1318,8 +1318,10 @@ goodix_reset_state (FpDevice *dev)
 
   if (priv->timeout)
     g_clear_pointer (&priv->timeout, g_source_destroy);
+  priv->cmd = 0;
   priv->ack = FALSE;
   priv->reply = FALSE;
+  priv->tls_cmd = FALSE;
   priv->callback = NULL;
   priv->user_data = NULL;
 }
