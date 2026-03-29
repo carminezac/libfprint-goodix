@@ -1079,10 +1079,11 @@ enum activate_5e0a_states {
   ACTIVATE_RESET_SENSOR,       /* 0xA2 — skip in IAP mode */
   ACTIVATE_READ_OTP,           /* 0xA6 — skip in IAP mode */
   ACTIVATE_CHECK_PSK,          /* 0xE4 — always */
-  ACTIVATE_UPLOAD_CONFIG,      /* 0x90 — skip in IAP mode */
   ACTIVATE_CMD_TLS,            /* 0xD0 — skip in IAP mode */
   ACTIVATE_POV_IMAGE_CHECK,    /* 0xD6 — skip in IAP mode */
   ACTIVATE_IMG_TLS,            /* 0xD0 — skip in IAP mode */
+  ACTIVATE_UPLOAD_CONFIG,      /* 0x90 — AFTER TLS, per RE flow */
+  ACTIVATE_SET_DRV_STATE,      /* 0xC4 [0x01, 0x00] — RE: no data response expected */
   ACTIVATE_DONE,
 
   ACTIVATE_5E0A_NUM_STATES,
@@ -1410,6 +1411,27 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
         if (!self->has_image_psk)
           fp_warn ("No image PSK — image TLS will likely fail");
         goodix_tls_init_image (dev, psk, psk_len, on_img_tls_complete, ssm);
+      }
+      break;
+
+    case ACTIVATE_SET_DRV_STATE:
+      if (self->in_iap_mode)
+        {
+          fpi_ssm_next_state (ssm);
+          break;
+        }
+      /* RE: SetDrvState sends [0x01, 0x00] via cmd 0xC4.
+       * No data response expected (RE: data_timeout=0).
+       * Use reply=FALSE to avoid waiting for data that never comes. */
+      fp_dbg ("SetDrvState (0xC4) [0x01, 0x00]...");
+      {
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (check_none_5e0a);
+        cb_info->user_data = ssm;
+        guint8 drv_payload[] = { 0x01, 0x00 };
+        goodix_send_protocol (dev, 0xc4, drv_payload, 2,
+                              NULL, TRUE, GOODIX_TIMEOUT, FALSE,
+                              goodix_receive_none, cb_info);
       }
       break;
 

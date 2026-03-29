@@ -85,14 +85,7 @@ def write_firmware(dev, fw_path, new_psk):
     firmware = fw_blob[1+ver_len:-4]
     print(f"  Firmware: {ver_str} ({len(firmware)} bytes)")
 
-    # Compute PMK HMAC and firmware HMAC (same as driver_55x4.py)
-    mod = bytes(range(1, 65))
-    raw_pmk = (struct.pack(">H", 32) + new_psk) * 2
-    pmk = hashlib.sha256(raw_pmk).digest()
-    pmk_hmac = hmac_mod.new(pmk, mod, hashlib.sha256).digest()
-    firmware_hmac = hmac_mod.new(pmk_hmac, firmware, hashlib.sha256).digest()
-
-    # CRC-32/MPEG-2
+    # CRC-32/MPEG-2 (RE: fcn.1800c78a0)
     def crc32_mpeg2(data):
         crc = 0xFFFFFFFF
         for b in data:
@@ -102,14 +95,41 @@ def write_firmware(dev, fw_path, new_psk):
                 crc &= 0xFFFFFFFF
         return crc
 
-    # Write firmware in 256-byte chunks (same as driver_55x4.py)
-    length = len(firmware)
-    for i in range(0, length, 256):
-        chunk = firmware[i:i + 256]
-        if not dev.write_firmware(i, chunk):
-            print(f"\n  Firmware write FAILED at offset {i}")
+    # Build write_buf exactly like DLL WriteApp (RE: 0x18009f6a8):
+    # [header_crc:4LE][payload_size:4LE][payload_crc:4LE][firmware_payload]
+    payload_crc = crc32_mpeg2(firmware)
+    size_and_crc = struct.pack('<II', len(firmware), payload_crc)
+    header_crc = crc32_mpeg2(size_and_crc)
+    write_buf = struct.pack('<I', header_crc) + size_and_crc + firmware
+    print(f"  Write buffer: {len(write_buf)} bytes (12 header + {len(firmware)} payload)")
+
+    # Compute PMK HMAC — RE: production_get_pmk_hmac @ 0x18003cf9c
+    # raw_pmk: PSK is ONLY in second half, first half is zeros
+    mod = bytes(range(1, 65))
+    raw_pmk = bytes([0x00, 0x20]) + bytes(32) + bytes([0x00, 0x20]) + new_psk
+    pmk = hashlib.sha256(raw_pmk).digest()
+    pmk_hmac = hmac_mod.new(pmk, mod, hashlib.sha256).digest()
+    # HMAC over write_buf (header + payload), NOT raw firmware
+    firmware_hmac = hmac_mod.new(pmk_hmac, write_buf, hashlib.sha256).digest()
+
+    # Write write_buf in chunks via cmd 0xF0
+    # DLL _WriteFw format: [offset:4][chunk_len:4][mode=2:4][data]
+    total = len(write_buf)
+    offset = 0
+    while offset < total:
+        chunk_len = min(256, total - offset)
+        pkt = struct.pack('<III', offset, chunk_len, 2) + write_buf[offset:offset+chunk_len]
+        dev.protocol.write(goodix.encode_message_pack(
+            goodix.encode_message_protocol(pkt, 0xF0)))
+        dev.protocol.read(timeout=5)  # ACK
+        resp = dev.protocol.read(timeout=5)
+        inner = goodix.check_message_protocol(
+            goodix.check_message_pack(resp), 0xF0)
+        if inner[0] not in (0, 1):
+            print(f"\n  Firmware write FAILED at offset {offset}: status={inner[0]}")
             return False
-        pct = int((i + len(chunk)) * 100 / length)
+        offset += chunk_len
+        pct = int(offset * 100 / total)
         print(f"\r  Writing firmware: {pct}%", end="", flush=True)
     print()
 
@@ -220,8 +240,17 @@ def main():
             dev.protocol.read(timeout=3)  # ACK (may timeout after reset)
         except:
             pass
-        print("  Waiting 2s for MCU reboot...", flush=True)
-        time.sleep(2)
+        print("  Waiting 3s for MCU reboot...", flush=True)
+        time.sleep(3)
+        # Re-init device after MCU reboot
+        dev = goodix.Device(0x5e0a, protocol.USBProtocol)
+        dev.nop()
+        try:
+            dev.enable_chip(True)
+        except:
+            pass
+        dev.nop()
+        print("  Reconnected after reboot", flush=True)
     else:
         print("\n[5/7] Already in IAP mode, skipping erase", flush=True)
 
