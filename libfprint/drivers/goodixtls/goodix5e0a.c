@@ -1075,14 +1075,15 @@ enum activate_5e0a_states {
   ACTIVATE_READ_AND_NOP1,
   ACTIVATE_ENABLE_CHIP,
   ACTIVATE_NOP2,
+  ACTIVATE_SLEEP_MODE,         /* 0x60 — first cmd in Start(), RE line 636 */
   ACTIVATE_CHECK_FW_VERSION,   /* 0xA8 — detect IAP mode */
   ACTIVATE_RESET_SENSOR,       /* 0xA2 — skip in IAP mode */
   ACTIVATE_READ_OTP,           /* 0xA6 — skip in IAP mode */
   ACTIVATE_CHECK_PSK,          /* 0xE4 — always */
+  ACTIVATE_UPLOAD_CONFIG,      /* 0x90 — before TLS */
   ACTIVATE_CMD_TLS,            /* 0xD0 — skip in IAP mode */
   ACTIVATE_POV_IMAGE_CHECK,    /* 0xD6 — skip in IAP mode */
   ACTIVATE_IMG_TLS,            /* 0xD0 — skip in IAP mode */
-  ACTIVATE_UPLOAD_CONFIG,      /* 0x90 — AFTER TLS, per RE flow */
   ACTIVATE_SET_DRV_STATE,      /* 0xC4 [0x01, 0x00] — RE: no data response expected */
   ACTIVATE_DONE,
 
@@ -1282,6 +1283,20 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
 
     case ACTIVATE_NOP2:
       goodix_send_nop (dev, check_none_5e0a, ssm);
+      break;
+
+    case ACTIVATE_SLEEP_MODE:
+      /* RE: First command in Start() is McuSwitchToSleepMode (0x60) */
+      fp_dbg ("McuSwitchToSleepMode (0x60)...");
+      {
+        GoodixCallbackInfo *cb_info = g_new (GoodixCallbackInfo, 1);
+        cb_info->callback = G_CALLBACK (check_none_5e0a);
+        cb_info->user_data = ssm;
+        guint8 sleep_payload[] = { 0x01, 0x00 };
+        goodix_send_protocol (dev, 0x60, sleep_payload, 2,
+                              NULL, TRUE, GOODIX_TIMEOUT, FALSE,
+                              goodix_receive_none, cb_info);
+      }
       break;
 
     case ACTIVATE_CHECK_FW_VERSION:
